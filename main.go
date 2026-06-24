@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/mdp/qrterminal/v3"
 	"github.com/pterm/pterm"
@@ -92,23 +93,36 @@ func runStart(ctx context.Context, sessionPath string) error {
 		}()
 	})
 
+	var cancelQR context.CancelFunc
+
 	client.Events.QrCode.Subscribe(func(ctx context.Context, qr maxclient.QrCode) {
-		logger.Info(
-			"Получен QR-код для входа",
-			logger.Args("действителен_до", qr.ExpiresAt.Local().Format("2006-01-02 15:04:05 MST")),
-		)
-		pterm.DefaultSection.Println("QR-код для авторизации в MAX")
-		qrterminal.GenerateWithConfig(qr.Link, qrterminal.Config{
-			Level:     qrterminal.L,
-			Writer:    os.Stdout,
-			BlackChar: qrterminal.BLACK,
-			WhiteChar: qrterminal.WHITE,
-			QuietZone: 1,
-		})
-		pterm.Println()
+		if cancelQR != nil {
+			cancelQR()
+		}
+
+		qrCtx, cancel := context.WithCancel(ctx)
+		cancelQR = cancel
+
+		go showQRCode(qrCtx, qr.Link, qr.ExpiresAt)
+		//logger.Info(
+		//	"Получен QR-код для входа",
+		//	logger.Args("действителен_до", qr.ExpiresAt.Local().Format("2006-01-02 15:04:05 MST")),
+		//)
+		//pterm.DefaultSection.Println("QR-код для авторизации в MAX")
+		//qrterminal.GenerateWithConfig(qr.Link, qrterminal.Config{
+		//	Level:     qrterminal.L,
+		//	Writer:    os.Stdout,
+		//	BlackChar: qrterminal.BLACK,
+		//	WhiteChar: qrterminal.WHITE,
+		//	QuietZone: 1,
+		//})
+		//pterm.Println()
 	})
 
 	client.Events.Ready.Subscribe(func(ctx context.Context, raw json.RawMessage) {
+		if cancelQR != nil {
+			cancelQR()
+		}
 		logger.Info("Успешное подключение к MAX, начинаем слушать входящие события")
 	})
 
@@ -163,6 +177,74 @@ func runStop(ctx context.Context, sessionPath string) error {
 		client.Stop(ctx.Err())
 		return ctx.Err()
 	}
+}
+func showQRCode(ctx context.Context, link string, expiresAt time.Time) {
+	pterm.Println()
+	pterm.Info.Println("Для входа откройте приложение MAX и отсканируйте QR-код:")
+	pterm.Println()
+
+	qrterminal.GenerateWithConfig(link, qrterminal.Config{
+		Level:     qrterminal.L,
+		Writer:    os.Stdout,
+		BlackChar: qrterminal.BLACK,
+		WhiteChar: qrterminal.WHITE,
+		QuietZone: 1,
+	})
+
+	pterm.Println()
+
+	area, err := pterm.DefaultArea.Start()
+	if err != nil {
+		pterm.Error.Printf("Не удалось создать область вывода: %v\n", err)
+		return
+	}
+	defer func(area *pterm.AreaPrinter) {
+		area.Stop()
+		pterm.Println()
+		pterm.Println()
+	}(area)
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		remaining := time.Until(expiresAt)
+
+		if remaining <= 0 {
+			area.Update(
+				pterm.Warning.Sprintf(
+					"⚠️ Время действия QR-кода истекло",
+				),
+			)
+			return
+		}
+
+		area.Update(
+			pterm.Sprintf(
+				"⏳ QR-код действителен ещё %s",
+				pterm.LightGreen(formatRemaining(remaining)),
+			),
+		)
+
+		select {
+		case <-ctx.Done():
+			return
+
+		case <-ticker.C:
+		}
+	}
+}
+
+func formatRemaining(d time.Duration) string {
+	total := int(d.Seconds())
+	if total < 0 {
+		total = 0
+	}
+
+	minutes := total / 60
+	seconds := total % 60
+
+	return fmt.Sprintf("%02d:%02d", minutes, seconds)
 }
 
 func readPassword(ctx context.Context, hint string) (string, error) {
